@@ -5,11 +5,11 @@ COPY ./worker ./worker
 COPY ./utils ./utils
 WORKDIR /app/worker
 RUN go mod download
-RUN go build -o worker ./
+RUN go build -o . ./
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 COPY --from=builder /app/worker .
 EXPOSE 8081
-CMD ["./worker"]
+CMD ["./TaskOneWorker"]
