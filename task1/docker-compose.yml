@@ -12,6 +12,8 @@ services:
       - PORT=8080
       - WORKER_URLS=http://worker-1:8081,http://worker-2:8081
       - REQUEST_TIMEOUT=120
+      - QUEUE_LEN=1
+      - MAX_CONCURRENT_QUERIES=1
     networks:
       - crackhash-net
 

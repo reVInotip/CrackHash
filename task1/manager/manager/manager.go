@@ -14,21 +14,25 @@ import (
 	"github.com/google/uuid"
 )
 
-const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-const cacheSize = 50
-const queueLen = 50
+const DefaultAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+const DefaultCacheSize = 50
+const DefaultQueueLen = 1000
+const DefaultMaxConcurrentQueries = 50
 
 type requestStatus string
 
 const (
 	statusInProgress requestStatus = "IN_PROGRESS"
+	statusPending	 requestStatus = "PENDING"
 	statusReady      requestStatus = "READY"
 	statusError      requestStatus = "ERROR"
 )
 
 type requestInfo struct {
+	id				 string
 	status           requestStatus
 	hash			 string
+	maxLen			 int
 	words            []string
 	partCount        int
 	receivedParts    map[int]bool // track which parts have responded
@@ -37,27 +41,39 @@ type requestInfo struct {
 }
 
 type manager struct {
-	requests 	 map[string]*requestInfo
-	requestCache map[string]string
-	requestQueue chan models.CrackRequest
-	mu           sync.RWMutex
-	client       *http.Client
-	workerURLs   []string
-	timeout      time.Duration
+	requests 	 		   map[string]*requestInfo
+	requestCache 		   map[string]string
+	requestQueue 		   chan *requestInfo
+	countConcurrentQueries int32
+	mu           		   sync.RWMutex
+	client       		   *http.Client
+	workerURLs   		   []string
+	timeout      		   time.Duration
+	alphabet			   string
+	cacheSize			   int
+	queueLen		 	   int
+	maxConcurrentQueries   int32
 }
 
-func NewManager(workerURLs []string, timeout time.Duration) *manager {
+func NewManager(workerURLs []string, timeout time.Duration, queueLen int,
+	alphabet string, cacheSize int, maxConcurrentQueries int) *manager {
 	return &manager{
-		requests:     make(map[string]*requestInfo),
-		requestCache: make(map[string]string),
-		requestQueue: make(chan models.CrackRequest),
-		client:       &http.Client{Timeout: 10 * time.Second},
-		workerURLs:   workerURLs,
-		timeout:      timeout,
+		requests:     		    make(map[string]*requestInfo),
+		requestCache: 		    make(map[string]string),
+		requestQueue: 		    make(chan *requestInfo, queueLen),
+		countConcurrentQueries: 0,
+		client:       		    &http.Client{Timeout: 10 * time.Second},
+		workerURLs:   		    workerURLs,
+		timeout:      		    timeout,
+		alphabet:	  		    alphabet,
+		cacheSize:	  		    cacheSize,
+		queueLen:	  		    queueLen,
+		maxConcurrentQueries:   int32(maxConcurrentQueries),
 	}
 }
 
 func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Handle crack request")
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -73,9 +89,6 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Add request to queue (channels already thread-safety)
-	m.requestQueue <- req
-
 	m.mu.RLock()
 	cachedReqID, ok := m.requestCache[req.Hash]
 	m.mu.RUnlock()
@@ -89,9 +102,6 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate request ID
-	requestID := uuid.New().String()
-
 	partCount := len(m.workerURLs)
 	if partCount == 0 {
 		http.Error(w, "No workers configured", http.StatusInternalServerError)
@@ -100,45 +110,84 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 
 	// Store request
 	info := &requestInfo{
+		id:			   uuid.New().String(),
 		status:        statusInProgress,
 		hash: 		   req.Hash,
+		maxLen:		   req.MaxLength,
 		words:         nil,
 		partCount:     partCount,
 		receivedParts: make(map[int]bool),
 	}
 	m.mu.Lock()
-	m.requests[requestID] = info
+	m.requests[info.id] = info
+
+	if m.countConcurrentQueries == m.maxConcurrentQueries {
+		log.Println("Add request to queue");
+
+		// Add request to queue (channels already thread-safety)
+		select {
+		case m.requestQueue <- info:
+			// we don't need to lock info here because it only
+			// owners are we and requestQueue that we already lock exclusive
+			info.status = statusPending
+
+			resp := models.CrackResponse{RequestID: info.id}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(resp)
+
+			m.mu.Unlock()
+			return
+		default:
+			http.Error(w, "Server is busy, try again later", http.StatusServiceUnavailable)
+
+			m.mu.Unlock()
+			return
+		}
+	}
+	m.countConcurrentQueries++;
 	m.mu.Unlock()
+
+	m.processTask(info)
+
+	resp := models.CrackResponse{RequestID: info.id}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (m *manager) processTask(info *requestInfo) {
+	info.mu.Lock()
+	defer info.mu.Unlock()
+
+	info.status = statusInProgress
 
 	// Set timeout
 	info.timeoutTimer = time.AfterFunc(m.timeout, func() {
 		m.mu.Lock()
-		defer m.mu.Unlock()
-		if ri, ok := m.requests[requestID]; ok && ri.status == statusInProgress {
+		if ri, ok := m.requests[info.id]; ok && ri.status == statusInProgress {
 			ri.status = statusError
 			ri.words = nil
-			log.Printf("Request %s timed out", requestID)
+			log.Printf("Request %s timed out", info.id)
 		}
+		m.mu.Unlock()
+
+		m.updateQueue()
 	})
 
 	// Send tasks to workers
 	for i, workerURL := range m.workerURLs {
 		partNumber := i + 1 // 1-based
 		task := models.WorkerTask{
-			RequestID:  requestID,
+			RequestID:  info.id,
 			PartNumber: partNumber,
-			PartCount:  partCount,
-			Hash:       req.Hash,
-			MaxLength:  req.MaxLength,
-			Alphabet:   alphabet,
+			PartCount:  info.partCount,
+			Hash:       info.hash,
+			MaxLength:  info.maxLen,
+			Alphabet:   m.alphabet,
 		}
 		go m.sendTask(workerURL, task) // async
 	}
-
-	resp := models.CrackResponse{RequestID: requestID}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
 }
 
 func (m *manager) sendTask(workerURL string, task models.WorkerTask) {
@@ -161,6 +210,7 @@ func (m *manager) sendTask(workerURL string, task models.WorkerTask) {
 }
 
 func (m *manager) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Handle status request")
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -196,6 +246,7 @@ func (m *manager) HandleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Handle response request")
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -239,17 +290,8 @@ func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
 	if len(info.receivedParts) == info.partCount {
 		info.status = statusReady
 
-		// update cache
-		if len(m.requestCache) + 1 > cacheSize {
-			var key string
-			for k, _ := range m.requestCache {
-				key = k
-				break
-			}
-
-			delete(m.requestCache, key)
-		}
-		m.requestCache[info.hash] = requestID
+		m.updateCache(requestID, info)
+		m.updateQueue()
 		
 		if info.timeoutTimer != nil {
 			info.timeoutTimer.Stop()
@@ -257,4 +299,32 @@ func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Request %s completed", requestID)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (m *manager) updateCache(requestID string, info *requestInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.requestCache) + 1 > m.cacheSize {
+		var key string
+		for k, _ := range m.requestCache {
+			key = k
+			break
+		}
+
+		delete(m.requestCache, key)
+	}
+	m.requestCache[info.hash] = requestID
+}
+
+func (m *manager) updateQueue() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.requestQueue) > 0 {
+		req := <-m.requestQueue
+		go m.processTask(req)
+	} else if m.countConcurrentQueries > 0 {
+		m.countConcurrentQueries--;
+	} else {
+		log.Fatal("Count concurrent queries can not be less then zero")
+	}
 }

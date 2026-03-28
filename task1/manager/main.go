@@ -40,7 +40,24 @@ func main() {
 	}
 	timeout := time.Duration(timeoutSec) * time.Second
 
-	mgr := manager.NewManager(workerURLs, timeout)
+	alphabet, ok := config.GetConfParam[string](config.GlobalConfig, "ALPHABET")
+	if !ok {
+		alphabet = manager.DefaultAlphabet
+	}
+	cacheSize, ok := config.GetConfParam[int](config.GlobalConfig, "CACHE_SIZE")
+	if !ok {
+		cacheSize = manager.DefaultCacheSize
+	}
+	queueLen, ok := config.GetConfParam[int](config.GlobalConfig, "QUEUE_LEN")
+	if !ok {
+		queueLen = manager.DefaultQueueLen
+	}
+	maxConcurrentQueries, ok := config.GetConfParam[int](config.GlobalConfig, "MAX_CONCURRENT_QUERIES")
+	if !ok {
+		maxConcurrentQueries = manager.DefaultMaxConcurrentQueries
+	}
+
+	mgr := manager.NewManager(workerURLs, timeout, queueLen, alphabet, cacheSize, maxConcurrentQueries)
 
 	srv := server.NewServer("manager")
 	srv.RegisterHandler(http.MethodPost, "/api/hash/crack", mgr.HandleCrack)
