@@ -8,35 +8,28 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"log"
-	"net/http"
-	"time"
+
+	br "TaskOneUtils/message_broker"
 )
 
 type worker struct {
-	managerURL string
-	client     *http.Client
+	msgBroker	br.MessageBroker
 }
 
-func NewWorker(managerURL string) *worker {
+func NewWorker(msgBroker br.MessageBroker) *worker {
 	return &worker{
-		managerURL: managerURL,
-		client:     &http.Client{Timeout: 10 * time.Second},
+		msgBroker: msgBroker,
 	}
 }
 
-func (w *worker) HandleTask(rw http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (w *worker) HandleTask(body []byte) {
 	var task models.WorkerTask
-	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
-		http.Error(rw, "Invalid JSON", http.StatusBadRequest)
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&task); err != nil {
+		log.Println("Invalid JSON")
 		return
 	}
-	// Acknowledge immediately, process in background
-	rw.WriteHeader(http.StatusOK)
-	go w.processTask(task)
+
+	w.processTask(task)
 }
 
 func (w *worker) processTask(task models.WorkerTask) {
@@ -56,15 +49,10 @@ func (w *worker) processTask(task models.WorkerTask) {
 		log.Printf("Failed to marshal response: %v", err)
 		return
 	}
-	url := w.managerURL + "/manager/internal/api/hash/crack/request"
-	httpResp, err := w.client.Post(url, "application/xml", bytes.NewReader(data))
+
+	err = w.msgBroker.SendMessage("worker_responses", "application/xml", data)
 	if err != nil {
-		log.Printf("Failed to send response to manager: %v", err)
-		return
-	}
-	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusOK {
-		log.Printf("Manager returned error: %s", httpResp.Status)
+		log.Printf("Can not send message to manager: %s", err)
 	}
 }
 

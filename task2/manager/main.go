@@ -3,13 +3,15 @@ package main
 import (
 	"log"
 	"net/http"
-	"strings"
+	"sync"
 	"time"
 
+	manager "TaskOneManager/manager"
 	config "TaskOneUtils/configuration"
 	def "TaskOneUtils/configuration/default_configs"
+	mongo "TaskOneUtils/db/mongodb"
 	server "TaskOneUtils/http_server"
-	manager "TaskOneManager/manager"
+	rabbitMQ "TaskOneUtils/message_broker/rabbitmq"
 )
 
 func main() {
@@ -26,13 +28,9 @@ func main() {
 	if _, ok := config.GetConfParam[int](config.GlobalConfig, "port"); !ok {
 		config.AddConfParam(config.GlobalConfig, "port", 8080)
 	}
-	workerURLsStr, ok := config.GetConfParam[string](config.GlobalConfig, "WORKER_URLS")
+	countWorkers, ok := config.GetConfParam[int](config.GlobalConfig, "COUNT_WORKERS")
 	if !ok {
-		log.Fatal("WORKER_URLS environment variable required (comma-separated)")
-	}
-	workerURLs := strings.Split(workerURLsStr, ",")
-	for i, u := range workerURLs {
-		workerURLs[i] = strings.TrimSpace(u)
+		log.Fatal("COUNT_WORKERS environment variable required")
 	}
 	timeoutSec, ok := config.GetConfParam[int](config.GlobalConfig, "REQUEST_TIMEOUT")
 	if !ok {
@@ -56,13 +54,55 @@ func main() {
 	if !ok {
 		maxConcurrentQueries = manager.DefaultMaxConcurrentQueries
 	}
+	dbURI, ok := config.GetConfParam[string](config.GlobalConfig, "DATABASE_URI")
+	if !ok {
+		log.Fatal("Can not start without database URI")
+	}
+	brokerURI, ok := config.GetConfParam[string](config.GlobalConfig, "BROKER_URI")
+	if !ok {
+		log.Fatal("Can not start without message broker URI")
+	}
+	dbClient, err := mongo.NewClient(dbURI, "crack_requests")
+	if err != nil {
+		log.Fatalf("Can not establish connection to database: %s\n", err)
+	}
+	broker, err := rabbitMQ.NewClient(brokerURI)
+	if err != nil {
+		log.Fatalf("Can not establish connection to message broker: %s\n", err)
+	}
+	err = broker.AddQueue("manager_requests")
+	if err != nil {
+		log.Fatalf("Can not create queue in message broker: %s\n", err)
+	}
+	err = broker.AddQueue("worker_responses")
+	if err != nil {
+		log.Fatalf("Can not create queue in message broker: %s\n", err)
+	}
 
-	mgr := manager.NewManager(workerURLs, timeout, queueLen, alphabet, cacheSize, maxConcurrentQueries)
+	defer dbClient.Close()
+	defer broker.Close()
+
+	mgr := manager.NewManager(countWorkers, timeout,
+		queueLen, alphabet, cacheSize,
+		maxConcurrentQueries, dbClient, broker)
 
 	srv := server.NewServer("manager")
 	srv.RegisterHandler(http.MethodPost, "/api/hash/crack", mgr.HandleCrack)
 	srv.RegisterHandler(http.MethodGet, "/api/hash/status", mgr.HandleStatus)
-	srv.RegisterHandler(http.MethodPost, "/internal/api/hash/crack/request", mgr.HandleWorkerResponse)
 
-	log.Fatal(srv.ServerLoop())
+	var wg sync.WaitGroup
+    
+    wg.Go(func() {
+        if err := srv.ServerLoop(); err != nil {
+            log.Fatal(err)
+        }
+    })
+    
+    wg.Go(func() {
+        if err := broker.RecvMessageLoop("worker_responses", mgr.HandleWorkerResponse); err != nil {
+            log.Fatal(err)
+        }
+    })
+    
+    wg.Wait()
 }

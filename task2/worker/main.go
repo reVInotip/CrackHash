@@ -2,16 +2,13 @@ package main
 
 import (
 	"log"
-	"net/http"
 	"strings"
 
 	conf "TaskOneUtils/configuration"
-	server "TaskOneUtils/http_server"
 	def "TaskOneUtils/configuration/default_configs"
 	worker "TaskOneWorker/worker"
+	rabbitMQ "TaskOneUtils/message_broker/rabbitmq"
 )
-
-
 
 func main() {
 	// Setup config
@@ -27,15 +24,28 @@ func main() {
 	if _, ok := conf.GetConfParam[int](conf.GlobalConfig, "port"); !ok {
 		conf.AddConfParam(conf.GlobalConfig, "port", 8081)
 	}
-	managerURL, ok := conf.GetConfParam[string](conf.GlobalConfig, "MANAGER_URL")
+	brokerURI, ok := conf.GetConfParam[string](conf.GlobalConfig, "BROKER_URI")
 	if !ok {
-		log.Fatal("MANAGER_URL environment variable required")
+		log.Fatal("Can not start without message broker URI")
 	}
-	managerURL = strings.TrimSuffix(managerURL, "/")
+	brokerURI = strings.TrimSuffix(brokerURI, "/")
 
-	wkr := worker.NewWorker(managerURL)
-	srv := server.NewServer("worker")
-	srv.RegisterHandler(http.MethodPost, "/internal/api/hash/crack/task", wkr.HandleTask)
+	broker, err := rabbitMQ.NewClient(brokerURI)
+	if err != nil {
+		log.Fatalf("Can not establish connection to message broker: %s\n", err)
+	}
+	err = broker.AddQueue("manager_requests")
+	if err != nil {
+		log.Fatalf("Can not create queue in message broker: %s\n", err)
+	}
+	err = broker.AddQueue("worker_responses")
+	if err != nil {
+		log.Fatalf("Can not create queue in message broker: %s\n", err)
+	}
 
-	log.Fatal(srv.ServerLoop())
+	defer broker.Close()
+
+	wkr := worker.NewWorker(broker)
+
+	go log.Fatal(broker.RecvMessageLoop("manager_requests", wkr.HandleTask))
 }

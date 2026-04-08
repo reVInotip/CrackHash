@@ -5,13 +5,16 @@ import (
 	"bytes"
 	"encoding/json"
 	"encoding/xml"
-	"io"
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
+	db "TaskOneUtils/db"
+	ent "TaskOneUtils/db/entities"
+	br "TaskOneUtils/message_broker"
 )
 
 const DefaultAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -46,30 +49,36 @@ type manager struct {
 	requestQueue 		   chan *requestInfo
 	countConcurrentQueries int32
 	mu           		   sync.RWMutex
-	client       		   *http.Client
-	workerURLs   		   []string
 	timeout      		   time.Duration
 	alphabet			   string
 	cacheSize			   int
 	queueLen		 	   int
 	maxConcurrentQueries   int32
+	databaseClient 		   db.Database
+	msgBroker			   br.MessageBroker
+	countWorkers		   int
 }
 
-func NewManager(workerURLs []string, timeout time.Duration, queueLen int,
-	alphabet string, cacheSize int, maxConcurrentQueries int) *manager {
-	return &manager{
+func NewManager(countWorkers int, timeout time.Duration, queueLen int, alphabet string, cacheSize int,
+	maxConcurrentQueries int, databaseClient db.Database, msgBroker br.MessageBroker) *manager {
+	m := &manager{
 		requests:     		    make(map[string]*requestInfo),
 		requestCache: 		    make(map[string]string),
 		requestQueue: 		    make(chan *requestInfo, queueLen),
 		countConcurrentQueries: 0,
-		client:       		    &http.Client{Timeout: 10 * time.Second},
-		workerURLs:   		    workerURLs,
 		timeout:      		    timeout,
 		alphabet:	  		    alphabet,
 		cacheSize:	  		    cacheSize,
 		queueLen:	  		    queueLen,
 		maxConcurrentQueries:   int32(maxConcurrentQueries),
+		databaseClient: 		databaseClient,
+		msgBroker: 				msgBroker,
+		countWorkers: 			countWorkers,
 	}
+
+	m.recoveryManager()
+
+	return m
 }
 
 func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +111,13 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	partCount := len(m.workerURLs)
+	currentWorkersCount := m.msgBroker.CountConsumers("manager_requests")
+	if currentWorkersCount == 0 {
+		http.Error(w, "Server don`t have enough workers, try again later", http.StatusServiceUnavailable)
+		return
+	}
+
+	partCount := m.countWorkers
 	if partCount == 0 {
 		http.Error(w, "No workers configured", http.StatusInternalServerError)
 		return
@@ -118,6 +133,7 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 		partCount:     partCount,
 		receivedParts: make(map[int]bool),
 	}
+
 	m.mu.Lock()
 	m.requests[info.id] = info
 
@@ -145,8 +161,15 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	m.countConcurrentQueries++;
 	m.mu.Unlock()
+
+	// Store request info to database
+	dbInfo := requestInfoToRequest(info)
+	err := m.databaseClient.CreateRequestWithoutConnRetry(dbInfo)
+	if err != nil {
+		http.Error(w, "Can not store request to persistent storage", http.StatusInternalServerError)
+		return
+	}
 
 	m.processTask(info)
 
@@ -157,6 +180,10 @@ func (m *manager) HandleCrack(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *manager) processTask(info *requestInfo) {
+	m.mu.Lock()
+	m.countConcurrentQueries++
+	m.mu.Unlock()
+
 	info.mu.Lock()
 	defer info.mu.Unlock()
 
@@ -175,37 +202,36 @@ func (m *manager) processTask(info *requestInfo) {
 		m.updateQueue()
 	})
 
-	// Send tasks to workers
-	for i, workerURL := range m.workerURLs {
-		partNumber := i + 1 // 1-based
+	partCount := m.countWorkers
+
+	// Send tasks to workers (1-based)
+	for i := 1; i <= partCount; i++ {
+		if info.receivedParts[i] {
+			continue
+		}
+
 		task := models.WorkerTask{
 			RequestID:  info.id,
-			PartNumber: partNumber,
+			PartNumber: i,
 			PartCount:  info.partCount,
 			Hash:       info.hash,
 			MaxLength:  info.maxLen,
 			Alphabet:   m.alphabet,
 		}
-		go m.sendTask(workerURL, task) // async
+		go m.sendTask(task) // async
 	}
 }
 
-func (m *manager) sendTask(workerURL string, task models.WorkerTask) {
-	url := workerURL + "/worker/internal/api/hash/crack/task"
+func (m *manager) sendTask(task models.WorkerTask) {
 	data, err := json.Marshal(task)
 	if err != nil {
 		log.Printf("Failed to marshal task: %v", err)
 		return
 	}
-	resp, err := m.client.Post(url, "application/json", bytes.NewReader(data))
+
+	err = m.msgBroker.SendMessage("manager_requests", "application/json", data)
 	if err != nil {
-		log.Printf("Failed to send task to worker %s: %v", workerURL, err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Printf("Worker %s returned error: %s", workerURL, body)
+		log.Printf("Can not send message to broker: %s", err)
 	}
 }
 
@@ -245,16 +271,11 @@ func (m *manager) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Handle response request")
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (m *manager) HandleWorkerResponse(body []byte) {
 	// Expect XML body
 	var workerResp models.WorkerResponse
-	if err := xml.NewDecoder(r.Body).Decode(&workerResp); err != nil {
-		http.Error(w, "Invalid XML", http.StatusBadRequest)
+	if err := xml.NewDecoder(bytes.NewReader(body)).Decode(&workerResp); err != nil {
+		log.Println("Invalid XML from worker response")
 		return
 	}
 	requestID := workerResp.RequestID
@@ -265,22 +286,24 @@ func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
 	info, ok := m.requests[requestID]
 	m.mu.RUnlock()
 	if !ok {
-		log.Printf("Received response for unknown request %s", requestID)
-		w.WriteHeader(http.StatusNotFound)
+		log.Printf("Received response for unknown request %s\n", requestID)
 		return
 	}
+
+	// Update request info in database
+	m.databaseClient.UpdateRequestReceivedPartsAndWords(requestID, partNumber, words)
 
 	info.mu.Lock()
 	defer info.mu.Unlock()
 	if info.status != statusInProgress {
 		// already done or error
-		w.WriteHeader(http.StatusOK)
+		log.Printf("Received response with unexpected status %s\n", requestID)
 		return
 	}
 	// Mark part as received
 	if info.receivedParts[partNumber] {
 		// duplicate, ignore
-		w.WriteHeader(http.StatusOK)
+		log.Printf("Received duplicate part for request %s\n", requestID)
 		return
 	}
 	info.receivedParts[partNumber] = true
@@ -288,6 +311,9 @@ func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
 
 	// Check if all parts received
 	if len(info.receivedParts) == info.partCount {
+		// Remove request info from database
+		m.databaseClient.DeleteRequest(requestID)
+
 		info.status = statusReady
 
 		m.updateCache(requestID, info)
@@ -298,7 +324,6 @@ func (m *manager) HandleWorkerResponse(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("Request %s completed", requestID)
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (m *manager) updateCache(requestID string, info *requestInfo) {
@@ -326,5 +351,54 @@ func (m *manager) updateQueue() {
 		m.countConcurrentQueries--;
 	} else {
 		log.Fatal("Count concurrent queries can not be less then zero")
+	}
+}
+
+func (m *manager) recoveryManager() {
+	requests, err := m.databaseClient.GetAllRequests()
+	if err != nil {
+		log.Printf("Failed recovery manager state: %s\n", err)
+		return
+	}
+
+	if len(requests) == 0 {
+		log.Println("Not found any running requests")
+		return
+	}
+
+	for i, request := range requests {
+		info := &requestInfo{
+			id:			   request.RequestID,
+			status:        statusInProgress,
+			hash: 		   request.Hash,
+			maxLen:		   request.MaxLen,
+			words:         request.Words,
+			partCount:     request.MaxLen,
+			receivedParts: request.ReceivedParts,
+		}
+
+		m.mu.Lock()
+		m.requests[info.id] = info
+		m.mu.Unlock()
+
+		if i < int(m.maxConcurrentQueries) {
+			go m.processTask(info)
+		} else {
+			info.status = statusPending
+			m.requestQueue <- info
+		}
+	}
+
+	log.Println("Recovery finish successfully")
+}
+
+func requestInfoToRequest(info *requestInfo) *ent.Request {
+	return &ent.Request{
+		RequestID: info.id,
+		Hash: info.hash,
+		MaxLen: info.maxLen,
+		Words: info.words,
+		PartCount: info.partCount,
+		ReceivedParts: info.receivedParts,
 	}
 }
