@@ -290,6 +290,11 @@ func (m *manager) HandleWorkerResponse(body []byte) {
 		return
 	}
 
+	if info.status != statusInProgress {
+		log.Printf("Received response for completed or error request %s\n", requestID)
+		return
+	}
+
 	// Update request info in database
 	m.databaseClient.UpdateRequestReceivedPartsAndWords(requestID, partNumber, words)
 

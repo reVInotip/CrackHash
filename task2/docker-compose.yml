@@ -12,7 +12,7 @@ services:
       - LISTEN_ADDR=0.0.0.0
       - PORT=8080
       - COUNT_WORKERS=2
-      - REQUEST_TIMEOUT=120
+      - REQUEST_TIMEOUT=500
       - QUEUE_LEN=1
       - MAX_CONCURRENT_QUERIES=1
       - BROKER_URI=amqp://myuser:mypassword@rabbitmq:5672/

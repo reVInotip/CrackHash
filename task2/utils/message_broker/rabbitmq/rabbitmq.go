@@ -28,20 +28,21 @@ func signalsSetup() chan os.Signal {
 	return stop
 }
 
-func (r *RabbitMQClient) waitReconnect() chan os.Signal {
+func (r *RabbitMQClient) waitReconnect() chan any {
     ticker := time.NewTicker(5 * time.Second)
     defer ticker.Stop()
     
-    arrived := make(chan os.Signal, 1)
+    arrived := make(chan any, 1)
     for {
         err := r.connect();
 
-        if err == nil && !r.conn.IsClosed() {
+        if err == nil && !r.conn.IsClosed() && !r.channel.IsClosed() {
             log.Println("Reconnect to RabbitMQ successfully")
+            arrived <- nil
             return arrived
         }
 
-        log.Println("Reconnection to RabbitMQ failed, retry in 5 seconds...")
+        log.Printf("Reconnection to RabbitMQ failed: %s, retry in 5 seconds...\n", err)
 
         select {
         case <- ticker.C:
@@ -62,15 +63,18 @@ func (r *RabbitMQClient) tryExecute(operation func() error) error {
                 return nil
             }
             
-            if !r.conn.IsClosed() {
+            if !r.conn.IsClosed() && !r.channel.IsClosed() {
                 return err
             }
             
             log.Printf("Connection error during operation: %v, will retry", err)
 
             select {
-            case <- r.waitReconnect():
-                return nil
+            case s := <- r.waitReconnect():
+                if s != nil {
+                    return nil
+                }
+                continue
             case <- r.stop:
                 log.Println("Stopping signal requested")
                 return nil
@@ -146,7 +150,7 @@ func (r *RabbitMQClient) SendMessage(queueName string, contentType string, body 
     })
 
     if err != nil {
-        log.Fatalf("Can not create queue %s", err)
+        log.Fatalf("Can not send message %s", err)
         return err
     }
 
@@ -198,7 +202,7 @@ func (r *RabbitMQClient) RecvMessageLoop(queueName string, recvCallback func([]b
                     recvCallback(d.Body)
                     requestComplete <- &d
                 }()
-            case err := <-notifyClose:
+            case err := <- notifyClose:
                 return err
             case <- r.stop:
                 log.Println("Stopping signal requested")
@@ -223,14 +227,18 @@ func (r *RabbitMQClient) CountConsumers(queueName string) int {
 func (r *RabbitMQClient) connect() error {
     var err error
 
-    if (r.channel != nil && r.channel.IsClosed()) ||
-        (r.conn != nil && r.conn.IsClosed()) {
+    if (r.channel != nil && !r.channel.IsClosed()) &&
+        (r.conn != nil && !r.conn.IsClosed()) {
         return nil
     }
     
     r.conn, err = amqp.Dial(r.url)
     if err != nil {
         return err
+    }
+
+    if r.channel != nil && !r.channel.IsClosed() {
+        return nil
     }
     
     r.channel, err = r.conn.Channel()

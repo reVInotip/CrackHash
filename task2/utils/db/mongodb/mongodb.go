@@ -2,11 +2,13 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 
 	db "TaskOneUtils/db"
 	ent "TaskOneUtils/db/entities"
@@ -34,11 +37,43 @@ func signalsSetup() chan os.Signal {
 	return stop
 }
 
-func (m *MongoDBClient) waitReconnect() chan os.Signal {
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var serverErr topology.ServerSelectionError
+	if errors.As(err, &serverErr) {
+		return true
+	}
+
+	errMsg := err.Error()
+	networkErrorPatterns := []string{
+		"connection reset by peer",
+		"i/o timeout",
+		"dial tcp",
+		"no reachable servers",
+		"handshake",
+		"server selection",
+		"connection refused",
+		"client is disconnected",
+		"unexpected EOF",
+	}
+
+	for _, pattern := range networkErrorPatterns {
+		if strings.Contains(strings.ToLower(errMsg), pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m *MongoDBClient) waitReconnect() chan any {
     ticker := time.NewTicker(5 * time.Second)
     defer ticker.Stop()
 
-    arrived := make(chan os.Signal, 1)
+    arrived := make(chan any, 1)
     for {
         ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
         err := m.client.Ping(ctx, nil)
@@ -46,6 +81,7 @@ func (m *MongoDBClient) waitReconnect() chan os.Signal {
 
         if err == nil {
             log.Println("Reconnect to MongoDB successfully")
+            arrived <- nil
             return arrived
         }
 
@@ -70,15 +106,19 @@ func (m *MongoDBClient) tryExecute(operation func() error) error {
                 return nil
             }
             
-            if err != mongo.ErrClientDisconnected {
+            if !isNetworkError(err) {
+                log.Printf("%T", err)
                 return err
             }
             
             log.Printf("Connection error during operation: %v, will retry", err)
 
             select {
-            case <- m.waitReconnect():
-                return nil
+            case s := <- m.waitReconnect():
+                if s != nil {
+                    return nil
+                }
+                continue
             case <- m.stop:
                 log.Println("Stopping signal requested")
                 return nil
@@ -147,14 +187,15 @@ func (m *MongoDBClient) CreateRequest(req *ent.Request) error {
 }
 
 func (m *MongoDBClient) GetRequestByID(requestID string) (*ent.Request, error) {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    
     var req ent.Request
-    collection := m.database.Collection("requests")
-    filter := bson.M{"request_id": requestID}
 
     err := m.tryExecute(func() error {
+        collection := m.database.Collection("requests")
+        filter := bson.M{"request_id": requestID}
+
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+
         err := collection.FindOne(ctx, filter).Decode(&req)
 
         if err != nil {
@@ -178,9 +219,10 @@ func (m *MongoDBClient) GetAllRequests() ([]ent.Request, error) {
     ctx := context.Background()
     
     var requests []ent.Request
-    collection := m.database.Collection("requests")
 
     err := m.tryExecute(func() error {
+        collection := m.database.Collection("requests")
+
         cursor, err := collection.Find(ctx, bson.M{})
         if err != nil {
             if err == mongo.ErrNoDocuments {
@@ -206,27 +248,27 @@ func (m *MongoDBClient) GetAllRequests() ([]ent.Request, error) {
 }
 
 func (m *MongoDBClient) UpdateRequestReceivedPartsAndWords(requestID string, receivedPart int, words []string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
     if words == nil {
         words = []string{}
     }
-    
-    collection := m.database.Collection("requests")
-    
-    filter := bson.M{"request_id": requestID}
-    update := bson.M{
-        "$set": bson.M{
-            "received_parts." + strconv.Itoa(receivedPart): true,
-            "updated_at": time.Now(),
-        },
-        "$push": bson.M{
-            "words": bson.M{"$each": words},
-        },
-    }
 
     err := m.tryExecute(func() error {
+        collection := m.database.Collection("requests")
+    
+        filter := bson.M{"request_id": requestID}
+        update := bson.M{
+            "$set": bson.M{
+                "received_parts." + strconv.Itoa(receivedPart): true,
+                "updated_at": time.Now(),
+            },
+            "$push": bson.M{
+                "words": bson.M{"$each": words},
+            },
+        }
+
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+
         result, err := collection.UpdateOne(ctx, filter, update)
         if err != nil {
             return err
