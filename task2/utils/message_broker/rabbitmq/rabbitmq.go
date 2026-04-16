@@ -107,7 +107,8 @@ func (r *RabbitMQClient) AddQueue(name string) error {
             false,        // exclusive
             false,        // no-wait
             amqp.Table{
-                    amqp.QueueTypeArg: amqp.QueueTypeQuorum,
+                amqp.QueueTypeArg: amqp.QueueTypeClassic,
+                "x-message-deduplication": true,
             },
         )
         if err != nil {
@@ -127,7 +128,7 @@ func (r *RabbitMQClient) AddQueue(name string) error {
     return nil
 }
 
-func (r *RabbitMQClient) SendMessage(queueName string, contentType string, body []byte) error {
+func (r *RabbitMQClient) SendMessage(queueName string, msgId string, contentType string, body []byte) error {
     err := r.tryExecute(func() error {
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
@@ -141,6 +142,9 @@ func (r *RabbitMQClient) SendMessage(queueName string, contentType string, body 
                 DeliveryMode: amqp.Persistent,
                 ContentType:  contentType,
                 Body:         body,
+                Headers: amqp.Table{
+                    "x-deduplication-header": msgId,
+                },
             })
         if err != nil {
             return err
@@ -158,18 +162,47 @@ func (r *RabbitMQClient) SendMessage(queueName string, contentType string, body 
     return nil
 }
 
-func (r *RabbitMQClient) RecvMessageLoop(queueName string, recvCallback func([]byte)) error {
-    err := r.channel.Qos(
-        1,     // prefetch count
-        0,     // prefetch size
-        false, // global
-    )
+func (r *RabbitMQClient) GetAllMessages(queueName string) (chan []byte, error) {
+    result := make(chan []byte, 20)
+    var lastTag uint64
 
-    if err != nil {
-        log.Panicf("Failed to set QoS: %s", err)
+    err := r.tryExecute(func() error {
+        log.Printf("Start getting messages from queue %s\n", queueName)
+        for {
+            msg, ok, err := r.channel.Get(queueName, false)
+            if err != nil {
+                return err
+            }
+            if !ok {
+                return nil
+            }
+
+            log.Printf("Copy message %s\n", msg.Body)
+
+            result <- msg.Body
+            lastTag = msg.DeliveryTag
+	    }
+    })
+
+    if lastTag != 0 {
+        r.channel.Nack(lastTag, true, true)
     }
 
-    err = r.tryExecute(func() error {
+    return result, err
+}
+
+func (r *RabbitMQClient) RecvMessageLoop(queueName string, recvCallback func([]byte)) error {
+    err := r.tryExecute(func() error {
+        err := r.channel.Qos(
+            1,     // prefetch count
+            0,     // prefetch size
+            false, // global
+        )
+
+        if err != nil {
+            return err
+        }
+
         msgs, err := r.channel.Consume(
             queueName, // queue
             "",     // consumer
@@ -217,7 +250,7 @@ func (r *RabbitMQClient) RecvMessageLoop(queueName string, recvCallback func([]b
         }
     })
 
-    return nil
+    return err
 }
 
 func (r *RabbitMQClient) CountConsumers(queueName string) int {

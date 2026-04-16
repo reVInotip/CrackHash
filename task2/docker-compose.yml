@@ -202,7 +202,7 @@ services:
       - crackhash-net
 
   rabbitmq:
-    image: rabbitmq:4-management
+    build: .
     container_name: rabbitmq
     hostname: "rabbitmq"
     restart: always

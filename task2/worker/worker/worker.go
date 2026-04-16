@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"log"
+	"strconv"
 
 	br "TaskOneUtils/message_broker"
 )
@@ -50,7 +51,7 @@ func (w *worker) processTask(task models.WorkerTask) {
 		return
 	}
 
-	err = w.msgBroker.SendMessage("worker_responses", "application/xml", data)
+	err = w.msgBroker.SendMessage("worker_responses", resp.RequestID + "_" + strconv.Itoa(resp.PartNumber), "application/xml", data)
 	if err != nil {
 		log.Printf("Can not send message to manager: %s", err)
 	}

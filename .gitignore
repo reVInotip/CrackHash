@@ -1,1 +1,2 @@
-*data
+*db_logs
+*rabbitmq_log

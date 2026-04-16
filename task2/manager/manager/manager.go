@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -229,7 +230,7 @@ func (m *manager) sendTask(task models.WorkerTask) {
 		return
 	}
 
-	err = m.msgBroker.SendMessage("manager_requests", "application/json", data)
+	err = m.msgBroker.SendMessage("manager_requests", task.RequestID + "_" + strconv.Itoa(task.PartNumber), "application/json", data)
 	if err != nil {
 		log.Printf("Can not send message to broker: %s", err)
 	}
@@ -313,9 +314,11 @@ func (m *manager) HandleWorkerResponse(body []byte) {
 	}
 	info.receivedParts[partNumber] = true
 	info.words = append(info.words, words...)
+	log.Printf("Update words for request %s", requestID)
 
 	// Check if all parts received
 	if len(info.receivedParts) == info.partCount {
+		log.Printf("Receive all parts of request %s", requestID)
 		// Remove request info from database
 		m.databaseClient.DeleteRequest(requestID)
 
@@ -360,6 +363,45 @@ func (m *manager) updateQueue() {
 }
 
 func (m *manager) recoveryManager() {
+	requestStatuses := make(map[string]*requestInfo)
+
+	workerResponses, err := m.msgBroker.GetAllMessages("worker_responses")
+	if err != nil {
+		log.Printf("Failed getting already received responses: %s, so retry all\n", err)
+	} else {
+		loop:
+		for {
+			select {
+			case resp := <- workerResponses:
+				// Expect XML body
+				var workerResp models.WorkerResponse
+				if err := xml.NewDecoder(bytes.NewReader(resp)).Decode(&workerResp); err != nil {
+					log.Println("Invalid XML from worker response")
+					return
+				}
+				
+				log.Printf("Update info about message %s", workerResp.RequestID)
+				info, ok := requestStatuses[workerResp.RequestID]
+				if ok {
+					info.receivedParts[workerResp.PartNumber] = true
+					info.words = append(info.words, workerResp.Words...)
+				} else {
+					requestStatuses[workerResp.RequestID] = &requestInfo{
+						id:			   workerResp.RequestID,
+						status:        statusInProgress,
+						words:         workerResp.Words,
+						receivedParts: make(map[int]bool),
+					}
+
+					requestStatuses[workerResp.RequestID].receivedParts[workerResp.PartNumber] = true
+				}
+			default:
+				log.Println("Continue to send messages")
+				break loop
+			}
+		}
+	}
+
 	requests, err := m.databaseClient.GetAllRequests()
 	if err != nil {
 		log.Printf("Failed recovery manager state: %s\n", err)
@@ -372,19 +414,33 @@ func (m *manager) recoveryManager() {
 	}
 
 	for i, request := range requests {
+		m.mu.Lock()
+		m.requests[request.RequestID] = &requestInfo{
+			id:			   request.RequestID,
+			status:        statusInProgress,
+			hash: 		   request.Hash,
+			maxLen:		   request.MaxLen,
+			words:         request.Words,
+			partCount:     request.PartCount,
+			receivedParts: request.ReceivedParts,
+		}
+		m.mu.Unlock()
+
 		info := &requestInfo{
 			id:			   request.RequestID,
 			status:        statusInProgress,
 			hash: 		   request.Hash,
 			maxLen:		   request.MaxLen,
 			words:         request.Words,
-			partCount:     request.MaxLen,
+			partCount:     request.PartCount,
 			receivedParts: request.ReceivedParts,
 		}
 
-		m.mu.Lock()
-		m.requests[info.id] = info
-		m.mu.Unlock()
+		requestStatus, ok := requestStatuses[request.RequestID]
+		if ok {
+			info.receivedParts = requestStatus.receivedParts
+			info.words = requestStatus.words
+		}
 
 		if i < int(m.maxConcurrentQueries) {
 			go m.processTask(info)
