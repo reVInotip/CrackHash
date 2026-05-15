@@ -1,0 +1,236 @@
+version: '3.8'
+
+services:
+  manager:
+    build:
+      context: .
+      dockerfile: ./manager/Dockerfile
+    restart: "always"
+    ports:
+      - "8080:8080"
+    environment:
+      - LISTEN_ADDR=0.0.0.0
+      - PORT=8080
+      - COUNT_WORKERS=2
+      - REQUEST_TIMEOUT=500
+      - QUEUE_LEN=1
+      - MAX_CONCURRENT_QUERIES=1
+      - BROKER_URI=amqp://myuser:mypassword@rabbitmq:5672/
+      - DATABASE_URI=mongodb://mongo-1:27017,mongo-2:27017,mongo-3:27017/?replicaSet=super_set
+    networks:
+      - crackhash-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      mongo-1:
+        condition: service_healthy
+      mongo-2:
+        condition: service_healthy
+      mongo-3:
+        condition: service_healthy
+      mongo-init-replica:
+        condition: service_completed_successfully
+
+  worker-1:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    restart: "always"
+    environment:
+      - LISTEN_ADDR=0.0.0.0
+      - PORT=8081
+      - BROKER_URI=amqp://myuser:mypassword@rabbitmq:5672/
+    networks:
+      - crackhash-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+  
+  worker-2:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    restart: "always"
+    environment:
+      - LISTEN_ADDR=0.0.0.0
+      - PORT=8081
+      - BROKER_URI=amqp://myuser:mypassword@rabbitmq:5672/
+    networks:
+      - crackhash-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    
+  mongo-1:
+    image: mongo
+    container_name: mongo-1
+    restart: "always"
+    hostname: "mongo-1"
+    command: ["mongod", "--config", "/data/config.conf"]
+    ports:
+      - 27017:27017
+    volumes:
+      - ./data/db_logs/mongo_1.log:/data/log/mongo_1.log
+      - mongo-1-volume:/data/db
+      - ./data/db_conf/mongo_1.conf:/data/config.conf
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 20s
+      timeout: 5s
+      retries: 2
+      start_period: 40s
+    networks:
+      - crackhash-net
+
+  mongo-2:
+    image: mongo
+    container_name: mongo-2
+    restart: "always"
+    hostname: "mongo-2"
+    command: ["mongod", "--config", "/data/config.conf"]
+    ports:
+      - 27018:27017
+    volumes:
+      - ./data/db_logs/mongo_2.log:/data/log/mongo_2.log
+      - mongo-2-volume:/data/db
+      - ./data/db_conf/mongo_2.conf:/data/config.conf
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 20s
+      timeout: 5s
+      retries: 2
+      start_period: 40s
+    networks:
+      - crackhash-net
+  
+  mongo-3:
+    image: mongo
+    container_name: mongo-3
+    restart: "always"
+    hostname: "mongo-3"
+    command: ["mongod", "--config", "/data/config.conf"]
+    ports:
+      - 27019:27017
+    volumes:
+      - ./data/db_logs/mongo_3.log:/data/log/mongo_3.log
+      - mongo-3-volume:/data/db
+      - ./data/db_conf/mongo_3.conf:/data/config.conf
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 20s
+      timeout: 5s
+      retries: 2
+      start_period: 40s
+    networks:
+      - crackhash-net
+  
+  mongo-init-replica:
+    image: mongo
+    depends_on:
+      mongo-1:
+        condition: service_healthy
+      mongo-2:
+        condition: service_healthy
+      mongo-3:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      bash -c "
+        set -e
+
+        echo 'Wait to Mongo...'
+        until mongosh --host mongo-1:27017 --eval 'db.adminCommand(\"ping\")' --quiet >/dev/null 2>&1; do
+          sleep 2
+        done
+
+        echo 'Check replica set status...'
+        if mongosh --host mongo-1:27017 --quiet --eval '
+          var status = rs.status();
+          print(\"ok=\" + status.ok + \", state=\" + status.members[0].stateStr);
+          if (status.ok !== 1) {
+            quit(1);
+          }
+        ' 2>/dev/null; then
+          echo 'Replica set already initialized'
+          exit 0
+        fi
+
+        echo 'Initializing replica set...'
+        mongosh --host mongo-1:27017 --quiet --eval '
+          rs.initiate({
+            _id: \"super_set\",
+            members: [
+              { _id: 0, host: \"mongo-1:27017\" },
+              { _id: 1, host: \"mongo-2:27017\" },
+              { _id: 2, host: \"mongo-3:27017\" }
+            ]
+          });
+        ' 2>/dev/null
+
+        echo 'Waiting for replica set to be ready...'
+        for i in {1..30}; do
+          if mongosh --host mongo-1:27017 --quiet --eval '
+            var status = rs.status();
+            if (status.ok !== 1 ||
+              status.members[0].stateStr !== \"PRIMARY\" &&
+              status.members[1].stateStr !== \"PRIMARY\" &&
+              status.members[2].stateStr !== \"PRIMARY\") {
+              quit(1);
+            }
+          ' 2>/dev/null; then
+            echo 'Replica set is ready!'
+            exit 0
+          fi
+          
+          echo -n \"Attempt $i/30: \"
+          mongosh --host mongo-1:27017 --quiet --eval '
+            try {
+              var status = rs.status();
+              print(\"ok=\" + status.ok + \", state=\" + status.members[0].stateStr);
+            } catch(e) {
+              print(\"Not initialized yet\");
+            }
+          ' 2>/dev/null || echo \"Connection error\"
+          
+          sleep 2
+        done
+
+        echo 'ERROR: Replica set failed to become ready'
+        exit 1
+      "
+    networks:
+      - crackhash-net
+
+  rabbitmq:
+    build: .
+    container_name: rabbitmq
+    hostname: "rabbitmq"
+    restart: always
+    ports:
+      - "5672:5672" # Standard AMQP port
+      - "15672:15672" # Management UI port
+    environment:
+      - RABBITMQ_DEFAULT_USER=myuser
+      - RABBITMQ_DEFAULT_PASS=mypassword
+    volumes:
+      - rabbitmq_data:/data/rabbitmq # Persist data
+      - ./data/rabbitmq_log:/data/rabbitmq   # Persist logs
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 20s
+      timeout: 5s
+      retries: 2
+      start_period: 40s
+    networks:
+      - crackhash-net
+
+volumes:
+  mongo-1-volume:
+  mongo-2-volume:
+  mongo-3-volume:
+  rabbitmq_data:
+  rabbitmq_log:
+
+networks:
+  crackhash-net:
+    driver: bridge
